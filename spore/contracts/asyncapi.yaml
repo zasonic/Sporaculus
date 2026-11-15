@@ -1,0 +1,163 @@
+asyncapi: 3.0.0
+info:
+  title: Spore Device Gateway — MQTT Topic Contract
+  version: 0.1.0
+  description: >
+    MQTT 5 topic contracts between the backend device gateway and edge
+    controllers (Mycodo / ESPHome / simulator). All payloads are JSON and must
+    validate against the corresponding channel message schema. Commands are
+    idempotent (command_id is the idempotency key) and every command MUST be
+    acknowledged or it is marked TIMED_OUT after 30 s. The edge watchdog runs
+    independently of MQTT: no heartbeat for 60 s => all actuators OFF.
+
+defaultContentType: application/json
+
+servers:
+  production:
+    host: mosquitto.local
+    protocol: MQTT
+    version: v5
+    description: TLS + per-device credentials issued by POST /devices.
+
+channels:
+  device.status:
+    address: farm/devices/{device_id}/status
+    description: Retained LWT-style status document; broker publishes 'offline' on disconnect via last-will.
+    messages:
+      statusMessage:
+        payload:
+          $schema: "https://json-schema.org/draft/2020-12/schema"
+          type: object
+          required: [device_id, state, ts]
+          properties:
+            device_id: {type: string}
+            state: {type: string, enum: [online, offline, degraded]}
+            edge_stack: {type: string, enum: [mycodo, esphome, simulator, custom]}
+            firmware_version: {type: string}
+            ts: {type: string, format: date-time}
+
+  device.telemetry:
+    address: farm/devices/{device_id}/telemetry
+    description: Sensor batch (QoS 1). Backend assigns ingest_seq; devices may include a monotonic local_seq for duplicate detection.
+    messages:
+      telemetryBatch:
+        payload:
+          $schema: "https://json-schema.org/draft/2020-12/schema"
+          type: object
+          required: [device_id, ts, readings]
+          properties:
+            device_id: {type: string}
+            ts: {type: string, format: date-time}
+            readings:
+              type: array
+              minItems: 1
+              maxItems: 50
+              items:
+                type: object
+                required: [sensor_id, metric, value, unit]
+                properties:
+                  sensor_id: {type: string}
+                  metric:
+                    type: string
+                    enum: [temperature, humidity, co2, substrate_moisture,
+                           light_state, fan_state, heater_state,
+                           humidifier_state, camera_health]
+                  value: {type: number}
+                  unit: {type: string, enum: [C, percent, ppm, g, bool, raw]}
+                  local_seq: {type: integer, minimum: 0}
+
+  device.command:
+    address: farm/devices/{device_id}/commands
+    description: >
+      Backend -> edge commands (QoS 1). Safety envelope already validated by
+      backend; edge MUST re-validate locally before actuation (defense in
+      depth). Unknown actions must be acked with success=false.
+    messages:
+      commandMessage:
+        payload:
+          $schema: "https://json-schema.org/draft/2020-12/schema"
+          type: object
+          required: [command_id, action, issued_at]
+          properties:
+            command_id: {type: string, format: uuid}
+            action:
+              type: string
+              enum: [set_setpoint, set_actuator, stop_all, enter_fail_safe,
+                     clear_fail_safe, start_recipe, stop_recipe]
+            payload: {type: object}
+            issued_at: {type: string, format: date-time}
+            ttl_seconds: {type: integer, default: 30,
+                          description: Expired commands must be acked as stale, not executed.}
+
+  device.command_ack:
+    address: farm/devices/{device_id}/commands/{command_id}/ack
+    description: Edge -> backend execution result (QoS 1, retained false).
+    messages:
+      ackMessage:
+        payload:
+          $schema: "https://json-schema.org/draft/2020-12/schema"
+          type: object
+          required: [command_id, success, executed_at]
+          properties:
+            command_id: {type: string, format: uuid}
+            success: {type: boolean}
+            reason: {type: string, description: Machine-readable code when success=false, e.g. SAFETY_LOCAL_VETO, ACTUATOR_FAULT, STALE_COMMAND}
+            executed_at: {type: string, format: date-time}
+            resulting_state: {type: object}
+
+  device.health:
+    address: farm/devices/{device_id}/health
+    description: Heartbeat every 15 s (QoS 0). Includes actuator uptime counters used by cooldown/watchdog logic.
+    messages:
+      healthMessage:
+        payload:
+          $schema: "https://json-schema.org/draft/2020-12/schema"
+          type: object
+          required: [device_id, ts, sensors, actuators]
+          properties:
+            device_id: {type: string}
+            ts: {type: string, format: date-time}
+            rssi_dbm: {type: number}
+            uptime_s: {type: integer}
+            fail_safe_active: {type: boolean}
+            sensors:
+              type: array
+              items:
+                type: object
+                required: [sensor_id, ok]
+                properties:
+                  sensor_id: {type: string}
+                  ok: {type: boolean}
+                  health_score: {type: number, minimum: 0, maximum: 1}
+            actuators:
+              type: array
+              items:
+                type: object
+                required: [actuator_id, kind, state]
+                properties:
+                  actuator_id: {type: string}
+                  kind: {type: string, enum: [heater, humidifier, fan, dehumidifier, light, misting]}
+                  state: {type: string, enum: [on, off, fault]}
+                  runtime_total_s: {type: integer, minimum: 0}
+
+operations:
+  backendPublishesCommands:
+    action: send
+    channel: device.command
+    summary: Gateway dispatches validated, idempotent commands.
+  backendConsumesTelemetry:
+    action: receive
+    channel: device.telemetry
+    summary: Ingestion pipeline applies data-quality gates before storing.
+  backendConsumesAcks:
+    action: receive
+    channel: device.command_ack
+    summary: Command tracker moves records to ACKED/FAILED.
+  backendConsumesHealth:
+    action: receive
+    channel: device.health
+    summary: Heartbeat monitor marks devices offline after 60 s silence.
+  backendConsumesStatus:
+    action: receive
+    channel: device.status
+    summary: Retained status + MQTT last-will provide instant disconnect signal.
