@@ -1,0 +1,16 @@
+# MycoLoop safety envelope — Phase 0 deliverable.
+# This file is the single source of truth for biological + hardware limits.
+# The backend safety layer loads it at boot; the edge device enforces its own
+# copy independently so a backend crash can never produce unsafe actuation.
+min_temp_c: 10.0
+max_temp_c: 30.0
+min_humidity_pct: 50.0
+max_humidity_pct: 99.0
+max_co2_ppm: 3000
+min_fae_pct: 10
+max_heater_runtime_min: 20
+max_humidifier_runtime_min: 30
+actuator_cooldown_s: 30
+watchdog_timeout_s: 60
+sensor_invalid_behavior: fail_safe
+max_contamination_probability: 0.35

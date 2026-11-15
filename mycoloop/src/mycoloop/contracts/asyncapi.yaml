@@ -1,0 +1,226 @@
+asyncapi: 3.0.0
+info:
+  title: MycoLoop Device Bus
+  version: 0.1.0
+  description: >
+    MQTT 5 contract between the MycoLoop backend and edge controllers
+    (Mycodo, ESPHome/PlatformIO, or the bundled simulator). QoS 1 everywhere,
+    idempotency keys on commands, monotonic seq on telemetry, retained status
+    with last-will so silence is always interpretable.
+  license:
+    name: MIT
+defaultContentType: application/json
+
+servers:
+  mosquitto:
+    host: localhost:1883
+    protocol: mqtt
+    protocolVersion: '5'
+    description: Local broker (docker compose service "broker").
+  emqx:
+    host: broker.internal:1883
+    protocol: mqtt
+    protocolVersion: '5'
+    description: Production broker.
+
+channels:
+  deviceStatus:
+    address: farm/devices/{device_id}/status
+    description: Retained birth/last-will message. Offline is a fact, not a timeout guess.
+    parameters:
+      device_id:
+        description: Registry device id.
+    messages:
+      DeviceStatusMessage:
+        $ref: '#/components/messages/DeviceStatusMessage'
+  deviceTelemetry:
+    address: farm/devices/{device_id}/telemetry
+    description: Sensor readings. Duplicate (device_id, seq) is rejected by ingestion.
+    parameters:
+      device_id: {}
+    messages:
+      Telemetry:
+        $ref: '#/components/messages/Telemetry'
+  deviceCommands:
+    address: farm/devices/{device_id}/commands
+    description: Backend -> device. Same command_id may be republished; device must dedupe.
+    parameters:
+      device_id: {}
+    messages:
+      Command:
+        $ref: '#/components/messages/Command'
+  commandAck:
+    address: farm/devices/{device_id}/commands/{command_id}/ack
+    description: received -> applied | failed. Append-only journal on the backend.
+    parameters:
+      device_id: {}
+      command_id: {}
+    messages:
+      CommandAck:
+        $ref: '#/components/messages/CommandAck'
+  deviceHealth:
+    address: farm/devices/{device_id}/health
+    description: Heartbeat, uptime, per-sensor health, hardware watchdog state.
+    parameters:
+      device_id: {}
+    messages:
+      DeviceHealth:
+        $ref: '#/components/messages/DeviceHealth'
+  backendStatus:
+    address: farm/backend/status
+    description: Backend last-will. Devices arm their watchdog from this + command traffic.
+    messages:
+      BackendStatus:
+        $ref: '#/components/messages/BackendStatus'
+
+operations:
+  publishTelemetry:
+    action: send
+    channel:
+      $ref: '#/channels/deviceTelemetry'
+    messages:
+      - $ref: '#/channels/deviceTelemetry/messages/Telemetry'
+  publishStatus:
+    action: send
+    channel:
+      $ref: '#/channels/deviceStatus'
+  publishHealth:
+    action: send
+    channel:
+      $ref: '#/channels/deviceHealth'
+  acknowledgeCommand:
+    action: send
+    channel:
+      $ref: '#/channels/commandAck'
+  receiveCommand:
+    action: receive
+    channel:
+      $ref: '#/channels/deviceCommands'
+  backendIngestTelemetry:
+    action: receive
+    channel:
+      $ref: '#/channels/deviceTelemetry'
+  backendTrackAck:
+    action: receive
+    channel:
+      $ref: '#/channels/commandAck'
+
+components:
+  messages:
+    Telemetry:
+      name: Telemetry
+      title: Sensor reading
+      payload:
+        $ref: '#/components/schemas/Telemetry'
+    Command:
+      name: Command
+      title: Idempotent command envelope
+      payload:
+        $ref: '#/components/schemas/Command'
+    CommandAck:
+      name: CommandAck
+      payload:
+        $ref: '#/components/schemas/CommandAck'
+    DeviceHealth:
+      name: DeviceHealth
+      payload:
+        $ref: '#/components/schemas/DeviceHealth'
+    DeviceStatusMessage:
+      name: DeviceStatusMessage
+      payload:
+        $ref: '#/components/schemas/DeviceStatusMessage'
+    BackendStatus:
+      name: BackendStatus
+      payload:
+        type: object
+        properties:
+          state:
+            type: string
+            enum: [online, offline]
+          client_id:
+            type: string
+
+  schemas:
+    Telemetry:
+      type: object
+      additionalProperties: false
+      required: [device_id, seq, ts]
+      properties:
+        device_id: {type: string}
+        seq: {type: integer, minimum: 0, description: monotonic per device}
+        ts: {type: string, format: date-time}
+        temperature_c: {type: [number, 'null'], minimum: -40, maximum: 85}
+        humidity_pct: {type: [number, 'null'], minimum: 0, maximum: 100}
+        co2_ppm: {type: [integer, 'null'], minimum: 0, maximum: 60000}
+        substrate_moisture_pct: {type: [number, 'null'], minimum: 0, maximum: 100}
+        fan_pct: {type: [integer, 'null'], minimum: 0, maximum: 100}
+        light_pct: {type: [integer, 'null'], minimum: 0, maximum: 100}
+        actuators:
+          type: object
+          additionalProperties: {type: boolean}
+          description: heater | humidifier | fan | light
+        quality_flags:
+          type: array
+          items: {type: string}
+    Command:
+      type: object
+      additionalProperties: false
+      required: [command_id, device_id, kind, payload, idempotency_key, issued_at, expires_at]
+      properties:
+        command_id: {type: string}
+        device_id: {type: string}
+        kind: {type: string, enum: [setpoint, actuator, recipe, reboot]}
+        payload: {type: object}
+        idempotency_key: {type: string, minLength: 8, maxLength: 120}
+        issued_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+        attempt: {type: integer, minimum: 1}
+    CommandAck:
+      type: object
+      additionalProperties: false
+      required: [command_id, device_id, state, ts]
+      properties:
+        command_id: {type: string}
+        device_id: {type: string}
+        state: {type: string, enum: [received, applied, failed]}
+        ts: {type: string, format: date-time}
+        detail: {type: [string, 'null']}
+        duplicate: {type: boolean, default: false}
+    DeviceHealth:
+      type: object
+      additionalProperties: false
+      required: [device_id, ts, uptime_s, firmware]
+      properties:
+        device_id: {type: string}
+        ts: {type: string, format: date-time}
+        uptime_s: {type: integer, minimum: 0}
+        firmware: {type: string}
+        sensor_health:
+          type: object
+          additionalProperties: {type: number}
+        watchdog_state: {type: string, enum: [armed, fail_safe]}
+        watchdog_remaining_s: {type: [integer, 'null']}
+        safe_state: {type: object}
+        faults:
+          type: array
+          items: {type: string}
+    DeviceStatusMessage:
+      type: object
+      additionalProperties: false
+      required: [device_id, ts, state]
+      properties:
+        device_id: {type: string}
+        ts: {type: string, format: date-time}
+        state: {type: string, enum: [online, offline]}
+        firmware: {type: [string, 'null']}
+        reason: {type: [string, 'null']}
+
+  securitySchemes:
+    deviceUserPass:
+      type: userPassword
+      description: MQTT username = device_id, password = device token (hashed at rest).
+    deviceToken:
+      type: httpApiKey
+      in: header
+      name: X-Device-Token
+      description: HTTP telemetry fallback uses the same token.
