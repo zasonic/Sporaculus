@@ -1,0 +1,861 @@
+openapi: 3.1.0
+info:
+  title: Spore Backend API
+  description: >
+    Contract-first REST API for the Spore mycology platform (Phase 0).
+    The backend modular monolith is the single source of truth for biology,
+    devices, telemetry quality, recipes, vision features, and optimizer trials.
+    Authority model: Optimizer recommends -> Safety validator vetoes -> Human
+    approves -> Control engine executes -> Hardware watchdog protects.
+  version: 0.1.0
+servers:
+  - url: http://localhost:8000/api/v1
+tags:
+  - {name: devices}
+  - {name: telemetry}
+  - {name: cycles}
+  - {name: recipes}
+  - {name: control}
+  - {name: vision}
+  - {name: optimizer}
+  - {name: safety}
+paths:
+  /health:
+    get:
+      summary: Liveness/readiness probe
+      responses:
+        "200":
+          description: Service health
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ServiceHealth"}
+
+  /devices:
+    get:
+      tags: [devices]
+      summary: List registered devices
+      parameters:
+        - in: query
+          name: status
+          schema: {type: string, enum: [online, offline, degraded]}
+      responses:
+        "200":
+          description: Device list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Device"}
+    post:
+      tags: [devices]
+      summary: Register a device (returns one-time auth token)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/DeviceRegisterRequest"}
+      responses:
+        "201":
+          description: Registered
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DeviceRegistered"}
+        "409": {description: Device ID already exists}
+
+  /devices/{device_id}:
+    get:
+      tags: [devices]
+      summary: Get device with current health
+      parameters: [$ref: "#/components/parameters/DeviceId"]
+      responses:
+        "200":
+          description: Device
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Device"}
+        "404": {description: Not found}
+
+  /devices/{device_id}/commands:
+    post:
+      tags: [devices]
+      summary: >
+        Dispatch an idempotent command through the gateway to MQTT.
+        Commands outside the safety envelope are rejected with 422 and a
+        machine-readable reason. Requires X-Idempotency-Key header.
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CommandCreate"}
+      responses:
+        "202":
+          description: Accepted; tracked asynchronously via ack topic
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CommandRecord"}
+        "409":
+          description: Duplicate idempotency key (original returned)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CommandRecord"}
+        "422":
+          description: Rejected by safety validator
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SafetyRejection"}
+
+  /commands/{command_id}:
+    get:
+      tags: [devices]
+      summary: Poll command lifecycle (SENT/RECEIVED/ACKED/FAILED/TIMED_OUT)
+      parameters:
+        - in: path
+          name: command_id
+          required: true
+          schema: {type: string, format: uuid}
+      responses:
+        "200":
+          description: Command record
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CommandRecord"}
+        "404": {description: Unknown command}
+
+  /devices/{device_id}/readings:
+    get:
+      tags: [telemetry]
+      summary: Query cleaned readings (raw available with ?quality=raw|quarantined)
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+        - in: query
+          name: metric
+          schema: {type: string, enum: [temperature, humidity, co2, substrate_moisture, light_state, fan_state, heater_state, humidifier_state, camera_health]}
+        - in: query
+          name: from
+          schema: {type: string, format: date-time}
+        - in: query
+          name: to
+          schema: {type: string, format: date-time}
+        - in: query
+          name: quality
+          schema: {type: string, enum: [valid, quarantined, raw], default: valid}
+        - in: query
+          name: limit
+          schema: {type: integer, minimum: 1, maximum: 10000, default: 1000}
+      responses:
+        "200":
+          description: Readings
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Reading"}
+
+  /cycles:
+    get:
+      tags: [cycles]
+      summary: List grow cycles
+      parameters:
+        - in: query
+          name: stage
+          schema: {$ref: "#/components/schemas/Stage"}
+      responses:
+        "200":
+          description: Cycles
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/GrowCycle"}
+    post:
+      tags: [cycles]
+      summary: Create a grow cycle (strain + substrate batch + device + recipe)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/GrowCycleCreate"}
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GrowCycle"}
+        "422": {description: Invalid combination or unknown entities}
+
+  /cycles/{cycle_id}/events:
+    get:
+      tags: [cycles]
+      summary: Append-only stage/event ledger for a cycle
+      parameters: [$ref: "#/components/parameters/CycleId"]
+      responses:
+        "200":
+          description: Event log
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/StageEvent"}
+    post:
+      tags: [cycles]
+      summary: Record a stage event or annotation (transitions validated by state machine)
+      parameters: [$ref: "#/components/parameters/CycleId"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StageEventCreate"}
+      responses:
+        "201":
+          description: Appended
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StageEvent"}
+        "409":
+          description: Illegal transition
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/TransitionError"}
+
+  /cycles/{cycle_id}/harvests:
+    post:
+      tags: [cycles]
+      summary: Log a harvest with yield measurement
+      parameters: [$ref: "#/components/parameters/CycleId"]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HarvestCreate"}
+      responses:
+        "201":
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Harvest"}
+
+  /recipes:
+    get:
+      tags: [recipes]
+      summary: List recipes (latest versions)
+      responses:
+        "200":
+          description: Recipes
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Recipe"}
+    post:
+      tags: [recipes]
+      summary: Create recipe version (setpoints validated against safety envelope)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/RecipeCreate"}
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Recipe"}
+        "422":
+          description: Setpoint outside safety envelope
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SafetyRejection"}
+
+  /control/dry-run:
+    post:
+      tags: [control]
+      summary: Simulate a recipe on the chamber model without touching hardware
+      requestBody:
+        required: true
+        content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DryRunRequest"}
+      responses:
+        "200":
+          description: Simulation trace
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/DryRunResult"}
+
+  /vision/frames:
+    post:
+      tags: [vision]
+      summary: Ingest a captured frame's metadata (image stored by content hash)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/FrameCreate"}
+      responses:
+        "201":
+          description: Stored
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/VisionFrame"}
+
+  /vision/inferences:
+    get:
+      tags: [vision]
+      summary: Query inference results (filter by feature thresholds, cycle, stage)
+      parameters:
+        - in: query
+          name: cycle_id
+          schema: {type: string, format: uuid}
+        - in: query
+          name: stage
+          schema: {$ref: "#/components/schemas/Stage"}
+        - in: query
+          name: min_contamination_probability
+          schema: {type: number, minimum: 0, maximum: 1}
+        - in: query
+          name: model_version
+          schema: {type: string}
+      responses:
+        "200":
+          description: Inferences
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/VisionInference"}
+
+  /vision/frames/{frame_id}/correction:
+    post:
+      tags: [vision]
+      summary: Human correction workflow (feeds active-learning queue)
+      parameters:
+        - in: path
+          name: frame_id
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/HumanLabel"}
+      responses:
+        "201": {description: Correction recorded}
+
+  /optimizer/trials:
+    get:
+      tags: [optimizer]
+      summary: List optimizer trials
+      responses:
+        "200":
+          description: Trials
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/OptimizerTrial"}
+    post:
+      tags: [optimizer]
+      summary: Submit trial result (never contains direct actuator writes)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/OptimizerTrialCreate"}
+      responses:
+        "201":
+          description: Recorded
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OptimizerTrial"}
+
+  /optimizer/recommendations:
+    get:
+      tags: [optimizer]
+      summary: Pending recommendations awaiting human approval
+      responses:
+        "200":
+          description: Recommendations
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Recommendation"}
+
+  /optimizer/recommendations/{recommendation_id}/decision:
+    post:
+      tags: [optimizer]
+      summary: Approve or reject a recommendation (audit-logged)
+      parameters:
+        - in: path
+          name: recommendation_id
+          required: true
+          schema: {type: string, format: uuid}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ApprovalDecision"}
+      responses:
+        "200":
+          description: Decision recorded; approved recipes go through normal validation
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Recommendation"}
+        "409": {description: Already decided}
+
+  /safety/envelope:
+    get:
+      tags: [safety]
+      summary: Current safety envelope (read-only mirror of contracts/safety_envelope.yaml)
+      responses:
+        "200":
+          description: Envelope
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SafetyEnvelope"}
+
+  /safety/incidents:
+    get:
+      tags: [safety]
+      summary: Fail-safe activations, interlock vetoes, watchdog events
+      responses:
+        "200":
+          description: Incident list
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/SafetyIncident"}
+
+components:
+  parameters:
+    DeviceId:
+      in: path
+      name: device_id
+      required: true
+      schema: {type: string, pattern: "^dev-[a-z0-9-]+$"}
+    CycleId:
+      in: path
+      name: cycle_id
+      required: true
+      schema: {type: string, format: uuid}
+    IdempotencyKey:
+      in: header
+      name: X-Idempotency-Key
+      required: true
+      schema: {type: string, minLength: 8, maxLength: 128}
+      description: Repeated requests with the same key return the original command record.
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    DeviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+
+  schemas:
+    ServiceHealth:
+      type: object
+      required: [status, version, time]
+      properties:
+        status: {type: string, enum: [ok, degraded, down]}
+        version: {type: string}
+        time: {type: string, format: date-time}
+        checks:
+          type: object
+          additionalProperties: {type: string}
+
+    Stage:
+      type: string
+      enum: [INOCULATED, COLONIZING, COLONIZATION_COMPLETE, PINNING_INITIATED,
+             PINNING_ACTIVE, MATURATION, HARVEST_READY, HARVESTED,
+             FLUSH_COMPLETE, CONTAMINATED, ABORTED]
+
+    Device:
+      type: object
+      required: [device_id, name, kind, status]
+      properties:
+        device_id: {type: string, pattern: "^dev-[a-z0-9-]+$"}
+        name: {type: string}
+        kind: {type: string, enum: [chamber, incubator, tent, sensor_node]}
+        edge_stack: {type: string, enum: [mycodo, esphome, simulator, custom]}
+        status: {type: string, enum: [online, offline, degraded]}
+        last_heartbeat: {type: string, format: date-time}
+        sensors:
+          type: array
+          items:
+            type: object
+            properties:
+              sensor_id: {type: string}
+              metric: {type: string}
+              health_score: {type: number, minimum: 0, maximum: 1}
+              calibration_offset: {type: number}
+        actuators:
+          type: array
+          items:
+            type: object
+            properties:
+              actuator_id: {type: string}
+              kind: {type: string, enum: [heater, humidifier, fan, dehumidifier, light, misting]}
+              state: {type: string, enum: [on, off, fault]}
+
+    DeviceRegisterRequest:
+      type: object
+      required: [device_id, name, kind]
+      properties:
+        device_id: {type: string, pattern: "^dev-[a-z0-9-]+$"}
+        name: {type: string}
+        kind: {type: string, enum: [chamber, incubator, tent, sensor_node]}
+        edge_stack: {type: string, enum: [mycodo, esphome, simulator, custom], default: simulator}
+
+    DeviceRegistered:
+      allOf:
+        - {$ref: "#/components/schemas/Device"}
+        - type: object
+          properties:
+            auth_token:
+              type: string
+              description: Shown exactly once; used as MQTT username/password credential.
+
+    CommandCreate:
+      type: object
+      required: [action, issued_by]
+      properties:
+        action: {type: string, enum: [set_setpoint, set_actuator, stop_all, enter_fail_safe, clear_fail_safe, start_recipe, stop_recipe]}
+        payload:
+          type: object
+          description: >
+            Shape depends on action, e.g. {"metric":"temperature","value_c":24.5}
+            or {"actuator":"heater","state":"off"}. Validated against the safety
+            envelope before dispatch.
+        issued_by: {type: string, description: operator id or system component}
+        dry_run: {type: boolean, default: false}
+
+    CommandRecord:
+      type: object
+      required: [command_id, device_id, status]
+      properties:
+        command_id: {type: string, format: uuid}
+        device_id: {type: string}
+        idempotency_key: {type: string}
+        action: {type: string}
+        payload: {type: object}
+        status: {type: string, enum: [PENDING, SENT, RECEIVED, ACKED, FAILED, TIMED_OUT, REJECTED_BY_SAFETY]}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        ack:
+          type: object
+          properties:
+            success: {type: boolean}
+            reason: {type: string}
+            executed_at: {type: string, format: date-time}
+
+    SafetyRejection:
+      type: object
+      required: [error, violations]
+      properties:
+        error: {type: string, const: SAFETY_ENVELOPE_VIOLATION}
+        violations:
+          type: array
+          items:
+            type: object
+            required: [field, attempted, allowed_min, allowed_max]
+            properties:
+              field: {type: string}
+              attempted: {type: number}
+              allowed_min: {type: number}
+              allowed_max: {type: number}
+              rule: {type: string}
+
+    TransitionError:
+      type: object
+      required: [error, from_stage, attempted_stage, allowed]
+      properties:
+        error: {type: string, const: ILLEGAL_TRANSITION}
+        from_stage: {$ref: "#/components/schemas/Stage"}
+        attempted_stage: {$ref: "#/components/schemas/Stage"}
+        allowed:
+          type: array
+          items: {$ref: "#/components/schemas/Stage"}
+
+    Reading:
+      type: object
+      required: [device_id, sensor_id, metric, value, ts, quality]
+      properties:
+        device_id: {type: string}
+        sensor_id: {type: string}
+        metric: {type: string}
+        value: {type: number}
+        unit: {type: string}
+        ts: {type: string, format: date-time}
+        quality: {type: string, enum: [valid, suspect, quarantined, stale, duplicate]}
+        ingest_seq: {type: integer, format: int64}
+
+    GrowCycle:
+      type: object
+      required: [cycle_id, strain_id, substrate_batch_id, device_id, recipe_version_id, stage]
+      properties:
+        cycle_id: {type: string, format: uuid}
+        strain_id: {type: string}
+        substrate_batch_id: {type: string}
+        device_id: {type: string}
+        recipe_version_id: {type: string, format: uuid}
+        stage: {$ref: "#/components/schemas/Stage"}
+        started_at: {type: string, format: date-time}
+        ended_at: {type: string, format: date-time, nullable: true}
+        total_yield_g: {type: number, nullable: true}
+
+    GrowCycleCreate:
+      type: object
+      required: [strain_id, substrate_batch_id, device_id, recipe_version_id]
+      properties:
+        strain_id: {type: string}
+        substrate_batch_id: {type: string}
+        device_id: {type: string}
+        recipe_version_id: {type: string, format: uuid}
+
+    StageEventCreate:
+      type: object
+      required: [event_type]
+      properties:
+        event_type: {type: string, enum: [stage_transition, annotation, contamination_event, harvest, flush_started, flush_completed, abort]}
+        to_stage:
+          nullable: true
+          allOf: [{$ref: "#/components/schemas/Stage"}]
+        note: {type: string}
+        actor: {type: string, description: operator id, vision pipeline, or state machine}
+        severity: {type: string, enum: [info, warning, critical], default: info}
+
+    StageEvent:
+      allOf:
+        - {$ref: "#/components/schemas/StageEventCreate"}
+        - type: object
+          required: [event_id, cycle_id, ts]
+          properties:
+            event_id: {type: integer, format: int64, description: monotonic per cycle (append-only ledger)}
+            cycle_id: {type: string, format: uuid}
+            ts: {type: string, format: date-time}
+
+    HarvestCreate:
+      type: object
+      required: [fresh_weight_g]
+      properties:
+        fresh_weight_g: {type: number, minimum: 0}
+        flush_number: {type: integer, minimum: 1}
+        note: {type: string}
+
+    Harvest:
+      allOf:
+        - {$ref: "#/components/schemas/HarvestCreate"}
+        - type: object
+          properties:
+            harvest_id: {type: string, format: uuid}
+            cycle_id: {type: string, format: uuid}
+            ts: {type: string, format: date-time}
+
+    RecipeStage:
+      type: object
+      required: [stage, duration_hours, setpoints]
+      properties:
+        stage: {$ref: "#/components/schemas/Stage"}
+        duration_hours: {type: number, minimum: 0}
+        setpoints:
+          type: object
+          properties:
+            temperature_c: {type: number}
+            humidity_percent: {type: number}
+            co2_ppm: {type: number}
+            fresh_air_exchanges_per_hour: {type: number}
+            light_on_hours: {type: integer, minimum: 0, maximum: 24}
+
+    Recipe:
+      type: object
+      required: [recipe_id, version, stages]
+      properties:
+        recipe_id: {type: string}
+        version: {type: integer}
+        strain_filter: {type: string, nullable: true}
+        stages:
+          type: array
+          items: {$ref: "#/components/schemas/RecipeStage"}
+        created_by: {type: string}
+        created_at: {type: string, format: date-time}
+
+    RecipeCreate:
+      type: object
+      required: [recipe_id, stages]
+      properties:
+        recipe_id: {type: string}
+        strain_filter: {type: string, nullable: true}
+        stages:
+          type: array
+          minItems: 1
+          items: {$ref: "#/components/schemas/RecipeStage"}
+
+    DryRunRequest:
+      type: object
+      required: [recipe, horizon_hours]
+      properties:
+        recipe: {$ref: "#/components/schemas/Recipe"}
+        horizon_hours: {type: number, minimum: 1, maximum: 720}
+        ambient_profile:
+          type: array
+          items:
+            type: object
+            properties:
+              hour: {type: number}
+              ambient_temp_c: {type: number}
+              ambient_rh: {type: number}
+
+    DryRunResult:
+      type: object
+      required: [envelope_breaches, actuator_cycles, trace_summary]
+      properties:
+        envelope_breaches:
+          type: array
+          items:
+            type: object
+            properties:
+              metric: {type: string}
+              value: {type: number}
+              limit_min: {type: number}
+              limit_max: {type: number}
+              at_hour: {type: number}
+        actuator_cycles:
+          type: object
+          additionalProperties: {type: integer}
+        trace_summary: {type: string}
+
+    FrameCreate:
+      type: object
+      required: [device_id, cycle_id, captured_at, content_sha256]
+      properties:
+        device_id: {type: string}
+        cycle_id: {type: string, format: uuid}
+        captured_at: {type: string, format: date-time}
+        content_sha256: {type: string, pattern: "^[a-f0-9]{64}$"}
+        width: {type: integer}
+        height: {type: integer}
+        has_depth: {type: boolean, default: false}
+
+    VisionFrame:
+      allOf:
+        - {$ref: "#/components/schemas/FrameCreate"}
+        - type: object
+          properties:
+            frame_id: {type: string, format: uuid}
+            ingested_at: {type: string, format: date-time}
+
+    PhenotypeFeatures:
+      type: object
+      properties:
+        colonization_percent: {type: number, minimum: 0, maximum: 100}
+        pin_count: {type: integer, minimum: 0}
+        pin_density: {type: number}
+        cap_area_estimate_cm2: {type: number}
+        cap_volume_estimate_cm3: {type: number}
+        maturity_score: {type: number, minimum: 0, maximum: 1}
+        aborted_pin_count: {type: integer, minimum: 0}
+        growth_rate_24h: {type: number}
+        contamination_probability: {type: number, minimum: 0, maximum: 1}
+        contamination_type: {type: string, nullable: true}
+        wetness_score: {type: number, minimum: 0, maximum: 1}
+        dryness_score: {type: number, minimum: 0, maximum: 1}
+        condensation_score: {type: number, minimum: 0, maximum: 1}
+
+    VisionInference:
+      type: object
+      required: [inference_id, frame_id, model_version, confidence, features]
+      properties:
+        inference_id: {type: string, format: uuid}
+        frame_id: {type: string, format: uuid}
+        model_version: {type: string}
+        confidence: {type: number, minimum: 0, maximum: 1}
+        features: {$ref: "#/components/schemas/PhenotypeFeatures"}
+        inferred_at: {type: string, format: date-time}
+
+    HumanLabel:
+      type: object
+      required: [corrected_features, labeler]
+      properties:
+        corrected_features: {$ref: "#/components/schemas/PhenotypeFeatures"}
+        labeler: {type: string}
+        reason: {type: string}
+
+    OptimizerTrialCreate:
+      type: object
+      required: [study, params, objective_value]
+      properties:
+        study: {type: string}
+        params:
+          type: object
+          description: Proposed setpoint deltas only — never actuator commands.
+        objective_value: {type: number}
+        constraints_satisfied: {type: boolean}
+        cycle_ids:
+          type: array
+          items: {type: string, format: uuid}
+
+    OptimizerTrial:
+      allOf:
+        - {$ref: "#/components/schemas/OptimizerTrialCreate"}
+        - type: object
+          properties:
+            trial_id: {type: string, format: uuid}
+            created_at: {type: string, format: date-time}
+
+    Recommendation:
+      type: object
+      required: [recommendation_id, proposed_changes, rationale, confidence, status]
+      properties:
+        recommendation_id: {type: string, format: uuid}
+        based_on_cycle_count: {type: integer}
+        proposed_changes:
+          type: object
+          description: 'e.g. {"temperature_c": -1.1, "fae_percent": 12}'
+        expected_effects:
+          type: array
+          items: {type: string}
+        rationale: {type: string}
+        confidence: {type: string, enum: [low, medium, high]}
+        status: {type: string, enum: [pending_approval, approved, rejected, applied, rolled_back]}
+        clamped_by_safety: {type: boolean, description: true if max_single_step_delta reduced the proposal}
+
+    ApprovalDecision:
+      type: object
+      required: [approved, approver]
+      properties:
+        approved: {type: boolean}
+        approver: {type: string}
+        comment: {type: string}
+
+    SafetyEnvelope:
+      type: object
+      description: Mirror of contracts/safety_envelope.yaml; loaded at startup, immutable at runtime.
+      properties:
+        version: {type: integer}
+        environmental_limits: {type: object}
+        actuator_limits: {type: object}
+        watchdog: {type: object}
+        sensor_invalid_behavior: {type: string}
+
+    SafetyIncident:
+      type: object
+      required: [incident_id, kind, severity, ts]
+      properties:
+        incident_id: {type: string, format: uuid}
+        kind: {type: string, enum: [fail_safe_entered, fail_safe_exited, interlock_veto, watchdog_timeout, sensor_invalid, stuck_actuator, command_timed_out]}
+        severity: {type: string, enum: [info, warning, critical]}
+        device_id: {type: string, nullable: true}
+        detail: {type: object}
+        ts: {type: string, format: date-time}
+        acknowledged_by: {type: string, nullable: true}
+
+security:
+  - ApiKeyAuth: []

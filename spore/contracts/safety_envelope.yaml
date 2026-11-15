@@ -1,0 +1,72 @@
+# Spore — Safety Envelope (single source of truth)
+#
+# Every value here is loaded by spore/schemas/safety.py and enforced by:
+#   1. the control engine (setpoint validation),
+#   2. the MQTT command gateway (out-of-envelope commands are rejected),
+#   3. the edge watchdog (hardware-level failsafe, independent of backend).
+#
+# Layered authority model (never bypass this order):
+#   Optimizer recommends -> Safety validator vetoes -> Human approves
+#   -> Control engine executes -> Hardware watchdog protects.
+
+meta:
+  version: 1
+  updated: "2026-11-15"
+  owner: platform-safety
+  review_cycle_days: 90
+
+environmental_limits:
+  temperature_c:      {min: 10.0, max: 30.0}
+  humidity_percent:   {min: 50.0, max: 99.0}
+  co2_ppm:            {min: 400.0, max: 3000.0}
+  fresh_air_exchanges_per_hour: {min: 1.0, max: 24.0}
+  vpd_kpa:            {min: 0.2, max: 2.0}
+  light_on_hours_per_day:     {min: 0, max: 16}
+
+actuator_limits:
+  heater:      {max_runtime_minutes: 45, min_off_gap_seconds: 120}
+  humidifier:  {max_runtime_minutes: 30, min_off_gap_seconds: 90}
+  fan:         {max_runtime_minutes: 240, min_off_gap_seconds: 15}
+  dehumidifier:{max_runtime_minutes: 60, min_off_gap_seconds: 120}
+  light:       {max_runtime_minutes: 960, min_off_gap_seconds: 60}
+  misting:     {max_runtime_minutes: 10, min_off_gap_seconds: 300}
+
+watchdog:
+  actuator_watchdog_timeout_seconds: 60      # no heartbeat -> all actuators OFF
+  device_heartbeat_interval_seconds: 15
+  device_offline_after_seconds: 60          # 4 missed heartbeats + grace
+  command_ack_timeout_seconds: 30           # unacked command -> FAILED, not retried blindly
+  sensor_stale_after_seconds: 120           # reading older than this is INVALID
+
+sensor_invalid_behavior: fail_safe          # options: fail_safe | hold_last_good | reject_control
+fail_safe_state:
+  description: >
+    All actuators OFF except continuous low-speed fresh-air fan (if physically
+    safe to leave running). Backend raises a critical alert. No automatic exit;
+    requires human acknowledgment.
+  actuators_forced_off: [heater, humidifier, dehumidifier, misting, light]
+  fans_fail_open: true
+
+anti_flapping:
+  min_stage_duration_minutes: 30            # stage transitions cannot fire faster
+  controller_output_deadband_percent: 5     # ignore setpoint changes smaller than this
+  cooldown_between_recipe_switches_seconds: 300
+
+data_quality:
+  duplicate_window_seconds: 2               # identical (device,sensor,value) inside window dropped
+  outlier_zscore_threshold: 5.0             # beyond physical range OR statistical gate -> quarantine
+  max_calibration_offset:                   # calibration offsets outside these are rejected
+    temperature_c: 5.0
+    humidity_percent: 15.0
+    co2_ppm: 500.0
+
+optimizer_constraints:
+  optimizer_may_write_setpoints_directly: false   # permanent invariant
+  requires_human_approval_by_default: true
+  max_single_step_delta:                          # recommendations clamped to these deltas
+    temperature_c: 2.0
+    humidity_percent: 4.0
+    co2_ppm: 500.0
+    fae_per_hour: 4.0
+  min_completed_cycles_for_recommendation: 4
+  rollback_required: true
